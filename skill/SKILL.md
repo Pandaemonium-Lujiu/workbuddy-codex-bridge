@@ -1,6 +1,6 @@
 ---
 name: workbuddy-codex-bridge
-description: 本机 WorkBuddy 与 OpenAI Codex 双向任务交接桥的部署、配置、调用与排错。当需要让 WorkBuddy 与 Codex 互相派活、传递上下文、续接会话，或桥接报错（"需要登录"/"Not connected"/端口占用/模型不支持/工具缺失/续接失败）时使用本技能。
+description: 本机 WorkBuddy 与 OpenAI Codex / DSH（DeepSeek Harness）多宿主双向任务交接桥的部署、配置、调用与排错。当需要让 WorkBuddy 与 Codex / DSH 互相派活、传递上下文、续接会话，或桥接报错（"需要登录"/"Not connected"/端口占用/模型不支持/工具缺失/续接失败）时使用本技能。
 agent_created: true
 version: 2.3
 contributors: [WorkBuddy (小Q), OpenAI Codex, DSH (DeepSeek Harness)]
