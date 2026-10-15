@@ -279,6 +279,22 @@ function extractWorkBuddyText(stdout) {
   return raw;
 }
 
+// 净化子进程环境：剔除宿主（如 WorkBuddy App / Codex / DSH）注入的变量。
+// 2026-10-15 二分实验结论（A/B bisect，逐组加回验证）：
+//   全量宿主环境 → CLI 必报 "Authentication required"（假阳性，与登录态无关）；
+//   元凶组 = CLIENT_INFO_*（如 CLIENT_INFO_PRODUCT_NAME="WorkBuddy"，CLI 据此
+//   误判为"App 受控组件"去要宿主凭证）与 SANDBOX_*（App 沙箱 IPC 签名）；
+//   CODEBUDDY_*/WORKBUDDY_*/CLAUDE_* 为其余已知劫持面（CONFIG_DIR 等）。
+//   极净白名单环境在本机恒定通过。故此处统一剔除全部宿主签名前缀。
+function cleanWorkBuddyEnv() {
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (/^(CODEBUDDY_|WORKBUDDY_|CLAUDE_|CLIENT_INFO_|SANDBOX_|ACC_|GALILEO_)/i.test(key)) continue;
+    env[key] = value;
+  }
+  return env;
+}
+
 async function runWorkBuddy({ prompt, session_id, cwd, permission_mode }) {
   const workingDirectory = ensureDirectory(cwd);
   const entry = process.env.WORKBUDDY_CLI_ENTRY;
@@ -306,7 +322,7 @@ async function runWorkBuddy({ prompt, session_id, cwd, permission_mode }) {
 
   const child = spawn(process.execPath, args, {
     cwd: workingDirectory,
-    env: process.env,
+    env: cleanWorkBuddyEnv(),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -358,6 +374,11 @@ function classifyWorkBuddyFailure(stderr, code, signal) {
   }
   if (/EADDRINUSE|address already in use/i.test(text)) {
     return "WorkBuddy CLI 启动时端口被占用。修复：重试（桥会自动换随机端口），或设置 WORKBUDDY_CLI_PORT 指定空闲端口。" +
+      `（原始错误：${text.slice(-300)}）`;
+  }
+  if (/429|额度已用尽|quota|rate limit/i.test(text)) {
+    return "WorkBuddy CLI 账号额度已用尽或触发限流（429）。" +
+      "修复：前往 https://www.codebuddy.cn/profile/usage 查看额度/购买加量包，或改用其他模型（桥设置 workbuddyModel）。" +
       `（原始错误：${text.slice(-300)}）`;
   }
   return `WorkBuddy CLI 执行失败（code=${code}, signal=${signal}）。${text}`;

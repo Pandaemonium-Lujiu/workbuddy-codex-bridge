@@ -2,8 +2,8 @@
 name: workbuddy-codex-bridge
 description: 本机 WorkBuddy 与 OpenAI Codex 双向任务交接桥的部署、配置、调用与排错。当需要让 WorkBuddy 与 Codex 互相派活、传递上下文、续接会话，或桥接报错（"需要登录"/"Not connected"/端口占用/模型不支持/工具缺失/续接失败）时使用本技能。
 agent_created: true
-version: 2.2
-contributors: [WorkBuddy (小Q), OpenAI Codex]
+version: 2.3
+contributors: [WorkBuddy (小Q), OpenAI Codex, DSH (DeepSeek Harness)]
 ---
 
 # WorkBuddy ↔ Codex 双向交接桥
@@ -24,8 +24,10 @@ contributors: [WorkBuddy (小Q), OpenAI Codex]
 | 组件 | 路径 |
 |---|---|
 | 桥脚本（两模式：`codex` / `workbuddy`） | `%USERPROFILE%\Documents\Codex\<date>\new-chat\outputs\workbuddy-codex-bridge\server.mjs` |
-| WorkBuddy 侧 MCP 配置 | `%USERPROFILE%\.workbuddy\mcp.json` → server 名 `codex_bridge` |
+| DSH 互通桥（WorkBuddy→DSH，Codex 侧建） | `%USERPROFILE%\Documents\Codex\<date>\new-chat\outputs\codex-dsh-bridge\server.mjs`（自带 DSH Web 后端 `127.0.0.1:3082`） |
+| WorkBuddy 侧 MCP 配置 | `%USERPROFILE%\.workbuddy\mcp.json` → server 名 `codex_bridge` / `dsh_bridge` |
 | Codex 侧 MCP 配置 | `%USERPROFILE%\.codex\config.toml` → `[mcp_servers.workbuddy_bridge]` |
+| DSH 侧 MCP 配置 | `%USERPROFILE%\.dsh\profiles\<web\|desktop>\cordis.patch.yml` → 插件 `mcp-workbuddy-bridge` |
 | 完整版 CLI（反向必需） | `%APPDATA%\npm\node_modules\@tencent-ai\codebuddy-code\bin\codebuddy` |
 | 内置 CLI（**不可用于反向**） | `%LOCALAPPDATA%\Programs\WorkBuddy\resources\app.asar.unpacked\cli\bin\codebuddy` |
 
@@ -82,8 +84,9 @@ tool_timeout_sec = 600
 
 ## 调用方式
 
-- **WorkBuddy 内**：用 `ask_codex`；续聊传回上次 `thread_id`。关键参数：`access`（read-only 默认 / workspace-write）、`effort`（low~xhigh）、`cwd`。
+- **WorkBuddy 内**：`ask_codex`（→Codex）与 `ask_dsh`（→DSH，经 `dsh_bridge`）；续聊分别传回上次 `thread_id` / `session_id`。关键参数：`access`（read-only 默认 / workspace-write）、`effort`（low~xhigh）、`cwd`。
 - **Codex 内**：用 `ask_workbuddy`；续聊传回上次 `session_id`。
+- **DSH 内**：用 `ask_workbuddy`（与 Codex 侧同一条代码路径，DSH profile 插件注册）。
 
 > **thread 续接（Codex 补充）**
 > - 保存 `thread/start` 的 `thread.id`，续接用 `thread/resume` + `turn/start`。**别把 `turn.id` / MCP 请求 ID / 桥请求 ID 当 `thread_id`。**
@@ -92,6 +95,53 @@ tool_timeout_sec = 600
 > - 续接时 `cwd`/模型/权限/可用 MCP 可能不同；**不要假设恢复原环境与代理变量**。
 > - app-server 客户端应**按请求 ID 匹配响应、持续读取事件流**；判成功看 `turn/completed` 状态（`failed` / `interrupted` 不算）。只截文本增量会漏掉结束状态或审批请求。
 > - 长会话历史**可能需按游标分页读取**；`thread/resume` 不保证始终返回完整历史。
+
+## 三方互通：DSH（DeepSeek Harness）
+
+本机第三个 AI 宿主 **DSH**（`@deepseek-ai/dsh`，DeepSeek 官方 harness，Cordis 插件体系）加入互通：
+
+- **WorkBuddy → DSH**：复用 Codex 侧已建好的 `codex-dsh-bridge` 适配器（工具 `ask_dsh` 只读 / `ask_dsh_edit` 工作区写 / `list_dsh_sessions` 不调模型），在 WorkBuddy `mcp.json` 注册为 `dsh_bridge`。适配器自带 DSH 专属 Web 后端（`127.0.0.1:3082`，净环境 spawn、detached、文件锁防重入、会话跨后端重启持久化），**任何 MCP 客户端都能驱动**（已用手工 stdio 客户端实测）。
+- **DSH → WorkBuddy**：在 DSH profile 的 Cordis 补丁里加第二条 stdio MCP client 插件（`@deepseek-ai/dsh-mcp-client`），指向本桥 `server.mjs workbuddy` 模式——复用 `ask_workbuddy` 同一条代码路径。
+
+### DSH 侧配置（`%USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml`）
+
+```yaml
+- insert:
+    - id: mcp-workbuddy-bridge
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: workbuddy_bridge        # 存活实例内必须唯一（Codex 桥条目已占用 codex_bridge）
+        transport: stdio
+        command: "C:\\Program Files\\nodejs\\node.exe"
+        args:
+          - "<桥目录>\\server.mjs"
+          - workbuddy
+        cwd: "E:\\DSH"
+        env:
+          WORKBUDDY_CLI_ENTRY: "<完整版 CLI bin\\codebuddy 绝对路径>"
+          HTTP_PROXY: "http://127.0.0.1:7890"   # 显式给可用代理，勿依赖会话注入
+          NO_PROXY: "localhost,127.0.0.1,::1"
+        toolCallTimeoutMs: 600000
+        failOnStartupError: false            # 连接失败不阻塞宿主启动
+```
+
+要点：① `serverName` 决定工具注册名 `mcp__<serverName>__<rawName>`，同一存活实例内不可重名；② `failOnStartupError: false` 让 CLI 未装/未登录时只废该条目不拖垮 DSH；③ web / desktop 两个 profile 按日常入口选择（都加亦可，注意陷阱 21 的重复 id 问题）。
+
+### 防递归（`codex-dsh-bridge/backend.patch.yml`）
+
+DSH 后端会话同样能调 MCP，需按 id 禁用回呼 WorkBuddy 的条目，保持"后端是纯 Codex→DSH 路径"：
+
+```yaml
+- id: mcp-workbuddy-bridge
+  disabled: true
+```
+
+### 验证方法（零模型额度）
+
+手工 MCP stdio 客户端（spawn `server.mjs` → `initialize` → `tools/list` → `tools/call`）即可驱动适配器；`list_dsh_sessions` 不调模型，可先验通路再花额度。实测状态（2026-10-15）：
+
+- 正向 `ask_dsh` → `DSH-SMOKE-1015-OK`（模型 deepseek-V4.1-Flash，3082 后端会话持久化正常，旧会话可枚举）
+- 反向 `ask_workbuddy` → 代码路径验到 API 层（净化修复后认证通过），仅剩账号 429 额度墙（陷阱 22）
 
 ## 关键陷阱（按踩坑频率排序）
 
@@ -129,13 +179,22 @@ tool_timeout_sec = 600
 >     ① **代理显式覆盖为 mihomo 7890**——App 注入的 `HTTP_PROXY=127.0.0.1:64116` 可能已死（连接拒绝/502），codex 连不上 `wss://chatgpt.com/backend-api/codex/responses` 会重连 5 次后挂死（报 `Proxy connection failed: HTTP CONNECT failed with status 502`）；② **`default_tools_approval_mode=approve`**——`auto` 会把 ask_workbuddy 判为需审批，撞上 `approval_policy=never` 直接拒（报 `MCP tool call requires approval, but approval policy is never`）；③ **`< /dev/null`**——否则 exec 打印 `Reading additional input from stdin...` 挂等 EOF；④ `model_reasoning_effort=low`——配置默认可能是 xhigh，慢。注意 `default_tools_approval_mode` 合法值仅 `auto/prompt/writes/approve`（无 `never`）。
 > 17. **ACP 程序化登录（免 TUI 重新登录）**：完整版 CLI 支持 `codebuddy -d acp --acp --acp-transport stdio --port <随机高端口>`，JSON-RPC over stdio：`initialize` → `authenticate {"methodId":"internal"}`（微信登录；另有 iOA/external/selfhosted）→ 服务端发通知 `_codebuddy.ai/authUrl`（形如 `https://copilot.tencent.com/login?platform=CLI&state=<UUID>&version=<ver>`）→ 用户浏览器授权后 `authenticate` 响应携带 `codebuddy.ai/userinfo`（userId/userName/authType）。**必须净环境 spawn**（见陷阱 3）。登录态持久化到磁盘，之后 headless `--print` 直接复用。参考实现 `scripts/acp_auth_driver.mjs`。
 > 18. **SKILL.md 严禁 UTF-8 BOM**：BOM 会使 frontmatter 分隔符 `---` 失配，codex 报 `failed to load skill ...: missing YAML frontmatter delimited by ---`，技能静默不加载。中文 md 给人看可以带 BOM，**给机器解析的技能文件必须剥 BOM**（读缓冲去掉开头 `EF BB BF` 三字节）。
+>
+> **第四轮实战补充（2026-10-15，DSH 互通 + 环境净化根因落地）**
+> 19. **`CLIENT_INFO_PRODUCT_NAME="WorkBuddy"` 单变量即可伪造"未登录"**（陷阱 3 的精确化）：WorkBuddy App 会话向子进程注入该变量（连同 `SANDBOX_*`、`CODEBUDDY_*`、`WORKBUDDY_*`、`CLAUDE_*`、`ACC_*`、`GALILEO_*`），完整版 CLI 据此误判自己是"App 受控组件"去要宿主凭证 → 假报 `Authentication required`。A/B 二分实测：整组剔除必通、单加回该变量必挂（**与登录态无关**）。修复 = 桥内 `cleanWorkBuddyEnv()` 按前缀黑名单在 spawn 前净化（2026-10-15 已内置 server.mjs；复测认证层通过、错误变为 429 分类提示）。
+> 20. **reg.exe/WMIC 沙箱黑名单非致命**：被安全中心拦截时 CLI 打印 notice 后仍继续跑到 API 层。旧认知（pitfalls.md #10"必然 Authentication required、不可绕过"）判断过强——真实根因是环境变量污染（陷阱 19），黑名单只影响 notice。
+> 21. **DSH 宿主两级防崩**：① **重复 loader entry id 会崩整个宿主**——`mcp-wielo-skillhub` 在 web 与 desktop 两个 profile 都存在，两 patch 叠加加载即 `duplicate loader entry id`（单 profile 各载均正常）；DSH"启动即崩"先查跨 profile 重复 id。② 外部 MCP 连接失败不应拖垮宿主——插件条目用 `failOnStartupError: false`。
+> 22. **429 额度是账号级**：换模型（glm-5.3-flash / qwen3.5-max / deepseek-v4.1-flash / 默认）均 429 → 不是模型问题，是 https://www.codebuddy.cn/profile/usage 账号额度。桥的 `classifyWorkBuddyFailure` 已加 429 分支，直接把购买链接抛给调用方。
 
 ## 排错决策树
 
 | 现象 | 首查 |
 |---|---|
 | `Not connected`（WorkBuddy 侧） | 是否改过配置 → 重新信任 MCP |
-| 反向报"需要登录" | 三步：① 是否用了内置 CLI → 换完整版；② 环境变量是否被劫持；③ **完整版登录态是否过期（TTL 约 7h）→ 终端 `codebuddy` → `/login`，或用 ACP 程序化登录（陷阱 17）免 TUI** |
+| 反向报"需要登录" | 三步：① 是否用了内置 CLI → 换完整版；② 环境变量是否被劫持（元凶常是 `CLIENT_INFO_PRODUCT_NAME`，见陷阱 19）；③ **完整版登录态是否过期（TTL 约 7h）→ 终端 `codebuddy` → `/login`，或用 ACP 程序化登录（陷阱 17）免 TUI** |
+| 反向报 `429 额度已用尽` | 账号级额度 → https://www.codebuddy.cn/profile/usage 购买加量包（陷阱 22） |
+| DSH 启动即崩 `duplicate loader entry id` | 跨 profile 重复插件 id → 逐个查 `cordis.patch.yml`（陷阱 21） |
+| DSH 里看不到 `ask_workbuddy` 工具 | profile 补丁未加载 → 重启 DSH；或 `failOnStartupError` 吞掉了启动错误 → 看 DSH 日志 |
 | `codex exec` 挂起不返回 / 一直 "Reading additional input from stdin" | stdin 未关 → 命令尾加 `< /dev/null`；仍挂查代理（64116 已死 → 显式覆盖 7890） |
 | `MCP tool call requires approval, but approval policy is never` | `default_tools_approval_mode` 改用 `approve`（`auto` 不够） |
 | `failed to load skill ... missing YAML frontmatter delimited by ---` | SKILL.md 带了 UTF-8 BOM → 剥掉（陷阱 18） |
@@ -153,6 +212,7 @@ tool_timeout_sec = 600
 - **正向**：WorkBuddy 调 `ask_codex` 发一个 ping，应返回 `thread_id` + 正确回显。（2026-10-15 复验通过：`WB-FORWARD-PING-1015-OK`；引擎 hash 自动发现生效。）
 - **反向**：普通终端运行 `scripts/bridge_ping_workbuddy_test.mjs`（先改 `CLI_ENTRY` 为完整版路径），或让 Codex 调 `ask_workbuddy`，应返回 `session_id` + 正确回显。**前置检查**：完整版 CLI 登录态在有效期内（过期表现：`Authentication required`，修复 `/login` 或 ACP 程序化登录）。
 - **2026-10-15 全链路复验通过**：ACP 程序化登录（用户「熊猫师父」）后登录态持久化生效；正向 `ask_codex` 回显 `WB-FORWARD-PING-1015-OK`；反向 `codex exec`（配方见陷阱 16）回显 `WB-REVERSE-PING-1015-OK`，stderr 见 `mcp: workbuddy_bridge/ask_workbuddy started → (completed)`，监视器捕获 `workbuddy user → assistant` 双向消息。
+- **2026-10-15 DSH 三方互通**：正向 `ask_dsh` 复验通过（手工 MCP 客户端驱动 `dsh_bridge` → 回显 `DSH-SMOKE-1015-OK`，模型 deepseek-V4.1-Flash）；反向 `ask_workbuddy` 代码路径验到 API 层（`cleanWorkBuddyEnv` 净化后认证通过），仅剩 WorkBuddy CLI 账号 429 额度墙——缴费/购买后重跑同类探针即可闭环。两侧配置已落地：WorkBuddy `mcp.json`（`dsh_bridge`，**需重启会话生效**）、DSH web/desktop profile（`mcp-workbuddy-bridge`，**需重启 DSH 生效**）、`backend.patch.yml` 防递归 disable。
 
 ## 参考
 

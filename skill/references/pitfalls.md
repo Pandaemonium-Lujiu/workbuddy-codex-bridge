@@ -128,6 +128,42 @@ codex 报 `failed to load skill ...SKILL.md: missing YAML frontmatter delimited 
 
 其余 MCP 报错（ardot 50501 连接拒绝、wielokskillhub 401、chatgpt challenge 403）均为 config.toml 里**其他** MCP 服务器的既有噪声，不影响桥链路。
 
+## 第四轮实战（2026-10-15 下午：DSH 三方互通 + 环境净化根因）
+
+### 环境变量污染：假 "Authentication required" 的真根因（A/B 二分定位）
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 17 | 反向 `ask_workbuddy` 在 App 会话内必报 `Authentication required`，同机极净环境必通 | App 会话向子进程注入 `CLIENT_INFO_PRODUCT_NAME="WorkBuddy"`（**最强触发源，单变量即可复现**）；`SANDBOX_*` 需组合触发；`CODEBUDDY_*`/`WORKBUDDY_*`/`CLAUDE_*`/`ACC_*`/`GALILEO_*` 为其余已知劫持面。CLI 据此误判自己是"App 受控组件"去要宿主凭证 | 桥内 `cleanWorkBuddyEnv()`：spawn CLI 前按前缀黑名单剔除全部宿主签名变量（2026-10-15 内置 server.mjs） |
+
+实验方法：逐组加回二分（`env_bisect` → `env_solo` 单变量复测 → `env_confirm` 确认），全部探针在 `D:\WB\_tmp\`。**与登录态无关**——净化后同一登录态的错误从"未登录"变为"429 额度"（认证层通过的直接证据）。复验探针 `mcp_wb_e2e_probe_b3.mjs`：外层环境原样保留 `CLIENT_INFO_PRODUCT_NAME=WorkBuddy` + 4 个 `SANDBOX_*`，只由桥内部净化，CLI 一路打到 API 层。
+
+**旧认知修正**：#10 认为 reg.exe 黑名单"必然导致 Authentication required、不可绕过"——判断过强。实测黑名单拦截时 CLI 打印 notice（`Suppress this notice with: CODEBUDDY_SKIP_GIT_BASH_CHECK=1`）后仍继续执行到 API 层；真实根因是环境变量污染。
+
+### DSH 互通接入（2026-10-15）
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 18 | DSH 临时实例启动即崩 `duplicate loader entry id: mcp-wielo-skillhub` | 该插件 id 在 web 与 desktop 两个 profile 的 `cordis.patch.yml` 中都存在，两 patch 叠加加载即重名崩宿主（**改动前既有隐患**，非本轮引入） | 单 profile 单独加载均正常；DSH Desktop 入口（desktop profile）可正常用。日常勿让 web+desktop 叠加加载 |
+| 19 | DSH 零成本验证脚本报 `Unexpected token 'o', "not found"` | DSH 的 `/api/mcp.list` 等 HTTP 端点不存在（返回纯文本 not found），JSON.parse 失败 | 改用**手工 MCP stdio 客户端**驱动适配器（initialize → tools/list → tools/call）；`list_dsh_sessions` 不调模型，可零额度验通路 |
+
+三处配置落地（YAML/JSON 全部语法校验通过）：
+
+1. WorkBuddy `~/.workbuddy/mcp.json` → `dsh_bridge`（node + codex-dsh-bridge/server.mjs，env NO_PROXY）——**需重启 WorkBuddy 会话生效**。
+2. DSH `~/.dsh/profiles/web/cordis.patch.yml` 与 `~/.dsh/profiles/desktop/cordis.patch.yml` → `mcp-workbuddy-bridge` 插件（`@deepseek-ai/dsh-mcp-client`，stdio；`serverName: workbuddy_bridge` 在存活实例内唯一；`failOnStartupError: false`）。
+3. `codex-dsh-bridge/backend.patch.yml` → `mcp-workbuddy-bridge` `disabled: true`（防 DSH 后端会话递归回呼 WorkBuddy，保持后端是纯 Codex→DSH 路径）。
+
+验证结果：
+
+| 方向 | 方法 | 结果 |
+|---|---|---|
+| WorkBuddy → DSH | 手工 MCP 客户端驱动 `dsh_bridge` → `ask_dsh` | ✅ `DSH-SMOKE-1015-OK`（deepseek-V4.1-Flash；3082 后端会话持久化正常，旧会话可枚举） |
+| DSH → WorkBuddy | 探针 B3 驱动 workbuddy 模式桥（= DSH 插件同一条代码路径） | ⛔ 验到 API 层（净化修复后认证通过），仅剩账号 429 额度墙 |
+
+### 429 账号额度（当前唯一阻断）
+
+现象：`429 额度已用尽，请访问以下链接，购买加量包以获取更多额度：https://www.codebuddy.cn/profile/usage`。换模型（glm-5.3-flash / qwen3.5-max / deepseek-v4.1-flash / 默认）均 429 → **账号级**，与模型选择、登录态无关。处置：桥的 `classifyWorkBuddyFailure` 加 429 分支直接把购买链接抛给调用方；待缴费/购买后重跑 `mcp_wb_e2e_probe_b3.mjs` 同类探针闭环。
+
 ## 备份记录（本机）
 
 - `server.mjs.bak-20261013_1733`、`server.mjs.bak-20261013_1838`
