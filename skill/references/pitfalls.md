@@ -1,4 +1,4 @@
-﻿# 完整排查记录（2026-10-13 ~ 10-14 实战）
+# 完整排查记录（2026-10-13 ~ 10-14 实战）
 
 本文件记录 WorkBuddy ↔ Codex 双向桥从零打通时踩过的全部坑与证据，供后续复现和排错参考。
 
@@ -95,8 +95,38 @@ App 安装目录 `resources/app.asar.unpacked/cli/bin/cbc-prewarm` 是预热进�
 
 ### codex exec 手动复现反向的坑
 
-- `mcp_servers.workbuddy_bridge.default_tools_approval_mode` 合法值仅 `auto/prompt/writes/approve`（**无 never**）；手动复现反向用 `-c approval_policy=never -c mcp_servers.workbuddy_bridge.default_tools_approval_mode=auto`。
+- `mcp_servers.workbuddy_bridge.default_tools_approval_mode` 合法值仅 `auto/prompt/writes/approve`（**无 never**）；手动复现反向外围参数用 `-c approval_policy=never`，但 **`default_tools_approval_mode` 必须用 `approve`**——用 `auto` 会报 `MCP tool call requires approval, but approval policy is never`（2026-10-15 实测：`auto` 把 ask_workbuddy 判为需审批后遭 never 拒绝，`approve` 直接放行）。
+- ** stdin 必须关**：exec 打印 `Reading additional input from stdin...` 后挂等 EOF，命令尾加 `< /dev/null`。
+- **代理必须显式覆盖**：App 注入的 `HTTP_PROXY=127.0.0.1:64116` 会死（连接拒绝/502），codex 连 `wss://chatgpt.com` 重连 5 次后挂死；实测 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY=http://127.0.0.1:7890` + `NO_PROXY=127.0.0.1,localhost` 可通。
 - 从 `ask_codex` 路径内测反向必败：桥传 `-c mcp_servers.workbuddy_bridge.enabled=false` 是防递归保险丝（正常设计），反向测试必须从 Codex 自己的会话发起。
+
+## 第三轮实战（2026-10-15：ACP 程序化登录 + 双向全链路复验通过）
+
+### ACP 协议登录（免 TUI，本轮最大突破）
+
+前置：完整版 CLI v2.164.0；**必须净环境 spawn**（App 注入的 `CODEBUDDY_*` + 代理变量会让 CLI 启动约 2.6 秒后退岀，只传 PATH/SystemRoot/TEMP/USERPROFILE/APPDATA 等系统必需变量）。
+
+协议序列（stdio JSONL）：
+
+1. `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}` → 响应带 `authMethods`：`iOA` / `external`（Google/Github）/ `internal`（微信）/ `selfhosted`（企业域）。
+2. `{"jsonrpc":"2.0","id":2,"method":"authenticate","params":{"methodId":"internal"}}` → 服务端发通知 `_codebuddy.ai/authUrl`（`https://copilot.tencent.com/login?platform=CLI&state=<UUID>&version=2.164.0`）。
+3. 用户浏览器授权（约 40 秒）→ stderr 出现 `Successfully signed in.` → id=2 响应携带 `_meta.codebuddy.ai/userinfo`（userId/userName/authType）。
+4. 登录态**持久化到磁盘**：随后净环境 headless `--print` ping 直接回环（`WB-CLI-PING-1015-OK`，13.1s），无需再走 ACP。
+
+参考实现：`scripts/acp_auth_driver.mjs`（净环境 spawn + 协议序列 + 捕获 authUrl 落盘 + 600s 等授权）。端口须显式传随机高端口（`--port`），否则可能撞 App 服务代理端口（EADDRINUSE）。
+
+### SKILL.md BOM 陷阱
+
+codex 报 `failed to load skill ...SKILL.md: missing YAML frontmatter delimited by ---`——文件头 UTF-8 BOM（`EF BB BF`）把 frontmatter 分隔符顶掉了。中文 md 给人看可带 BOM，**机器解析的技能文件必须剥 BOM**。本轮 6 个文件（SKILL.md + references×2，部署副本与仓库副本）已剥。
+
+### 双向复验结果（2026-10-15）
+
+| 方向 | 命令 | 结果 |
+|---|---|---|
+| 正向 | `ask_codex`（effort=low, read-only） | ✅ `WB-FORWARD-PING-1015-OK`（thread_id 返回） |
+| 反向 | `codex exec --skip-git-repo-check -c approval_policy=never -c mcp_servers.workbuddy_bridge.default_tools_approval_mode=approve -c model_reasoning_effort=low "..." < /dev/null`（代理覆盖 7890） | ✅ `WB-REVERSE-PING-1015-OK`；stderr `mcp: workbuddy_bridge/ask_workbuddy started → (completed)`；监视器 5988 捕获 `workbuddy user → assistant` |
+
+其余 MCP 报错（ardot 50501 连接拒绝、wielokskillhub 401、chatgpt challenge 403）均为 config.toml 里**其他** MCP 服务器的既有噪声，不影响桥链路。
 
 ## 备份记录（本机）
 

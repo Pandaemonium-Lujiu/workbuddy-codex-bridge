@@ -1,8 +1,8 @@
-﻿---
+---
 name: workbuddy-codex-bridge
 description: 本机 WorkBuddy 与 OpenAI Codex 双向任务交接桥的部署、配置、调用与排错。当需要让 WorkBuddy 与 Codex 互相派活、传递上下文、续接会话，或桥接报错（"需要登录"/"Not connected"/端口占用/模型不支持/工具缺失/续接失败）时使用本技能。
 agent_created: true
-version: 2.1
+version: 2.2
 contributors: [WorkBuddy (小Q), OpenAI Codex]
 ---
 
@@ -97,7 +97,7 @@ tool_timeout_sec = 600
 
 1. **改配置 → 信任失效**：WorkBuddy 对自定义 MCP 的信任按配置哈希签名，**任何一次修改 `codex_bridge` 配置（含 env）都会使信任失效**，需在界面（侧边栏「插件」→ 右上角「MCP 服务器」）重新信任/重连。表现：工具报 `Not connected`。
 2. **内置 CLI 不能做反向**：它是 App 的受控组件——无 TUI 产物（无参数启动报 `Cannot find module '../dist/codebuddy'`）、凭证由 App 通过 prewarm IPC 注入（独立运行报 `Authentication required` 且卡数分钟）。**反向必须用完整版 npm CLI**。（App 的预热 IPC 客户端 `cbc-prewarm` 在 `resources/app.asar.unpacked/cli/bin/`，理论可 `activate` 借凭证跑会话，但当前无存活预热进程、未经实战验证，列为后续方向。）
-3. **环境变量劫持**：App 会话注入 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1` / `CODEBUDDY_FORCE_HEADLESS_BUNDLE=1`（强制走宿主模式变体）、`CODEBUDDY_CONFIG_DIR`（劫持配置目录）等上百个变量。桥/脚本若要独立跑 CLI，**必须清除所有 `CODEBUDDY_*` / `WORKBUDDY_*` 变量**，否则必报"需要登录"。
+3. **环境变量劫持**：App 会话注入 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1` / `CODEBUDDY_FORCE_HEADLESS_BUNDLE=1`（强制走宿主模式变体）、`CODEBUDDY_CONFIG_DIR`（劫持配置目录）、`CODEBUDDY_MCP_CONFIG`（巨型 JSON）等上百个变量，外加 `HTTP_PROXY=127.0.0.1:64116` 等代理变量。桥/脚本若要独立跑 CLI，**不能只删 `CODEBUDDY_*`——必须传全净环境**（仅 PATH/SystemRoot/windir/TEMP/USERPROFILE/APPDATA/LOCALAPPDATA/COMSPEC/PATHEXT 等系统必需变量），否则 ACP agent 启动约 2.6 秒即退出。
 4. **代理污染**：会话注入的 `HTTP_PROXY`（如 `127.0.0.1:49262`）常无法访问境外服务。Codex 报 `stream disconnected before completion` 时，改用可用代理（实测 `127.0.0.1:7890` 可通，HTTP 405 = 网络正常）或直连。
 5. **端口占用**：CLI 启动会复用记录的端口，可能 `EADDRINUSE`。桥调用 CLI 时应传 `--port <随机端口>`。
 6. **安全中心黑名单**：部分沙箱/安全策略拦截 `reg.exe`，导致完整版 CLI 无法读注册表解密凭证 → 报 `Authentication required`。此限制**不可绕过**，需在真实环境（普通终端）执行。
@@ -112,15 +112,33 @@ tool_timeout_sec = 600
 > 13. **审批必须被消费**：app-server 客户端须读取并响应服务端审批请求，否则相关操作会挂起或失败；不要为无人值守而全局关审批。
 >
 > **第二轮实战补充（2026-10-14）**
-> 14. **完整版 CLI 登录态有 TTL（实测约 7 小时）**：过期后报 `Authentication required. Please use /login command`。磁盘上无免交互恢复路径（local_storage/凭据管理器/溢写配置/DPAPI 全部排除，见 pitfalls.md 认证考古）。修复：终端 `codebuddy` → TUI `/login` → 浏览器授权。桥的 `classifyWorkBuddyFailure` 会直接把该修复指令抛给调用方。
-> 15. **从 `ask_codex` 路径内测反向必败**：桥传 `-c mcp_servers.workbuddy_bridge.enabled=false` 防递归（陷阱 7），反向测试必须从 Codex 自己的会话发起；用 `codex exec -c approval_policy=never -c mcp_servers.workbuddy_bridge.default_tools_approval_mode=auto "调用 ask_workbuddy..."` 可手动模拟（注意 `default_tools_approval_mode` 无 `never` 值）。
+> 14. **完整版 CLI 登录态有 TTL（实测约 7 小时）**：过期后报 `Authentication required. Please use /login command`。磁盘上无免交互恢复路径（local_storage/凭据管理器/溢写配置/DPAPI 全部排除，见 pitfalls.md 认证考古）。修复：终端 `codebuddy` → TUI `/login` → 浏览器授权；或走 ACP 程序化登录（陷阱 17）。桥的 `classifyWorkBuddyFailure` 会直接把该修复指令抛给调用方。
+> 15. **从 `ask_codex` 路径内测反向必败**：桥传 `-c mcp_servers.workbuddy_bridge.enabled=false` 防递归（陷阱 7），反向测试必须从 Codex 自己的会话发起。
+>
+> **第三轮实战补充（2026-10-15，双向全链路复验通过）**
+> 16. **`codex exec` 手动复现反向的制胜配方**（四要件缺一不可）：
+>     ```bash
+>     HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890 \
+>     ALL_PROXY=http://127.0.0.1:7890 NO_PROXY=127.0.0.1,localhost \
+>       codex exec --skip-git-repo-check \
+>       -c approval_policy=never \
+>       -c mcp_servers.workbuddy_bridge.default_tools_approval_mode=approve \
+>       -c model_reasoning_effort=low \
+>       "调用 ask_workbuddy 工具，参数 prompt 为：只回复 WB-REVERSE-PING-1015-OK……" < /dev/null
+>     ```
+>     ① **代理显式覆盖为 mihomo 7890**——App 注入的 `HTTP_PROXY=127.0.0.1:64116` 可能已死（连接拒绝/502），codex 连不上 `wss://chatgpt.com/backend-api/codex/responses` 会重连 5 次后挂死（报 `Proxy connection failed: HTTP CONNECT failed with status 502`）；② **`default_tools_approval_mode=approve`**——`auto` 会把 ask_workbuddy 判为需审批，撞上 `approval_policy=never` 直接拒（报 `MCP tool call requires approval, but approval policy is never`）；③ **`< /dev/null`**——否则 exec 打印 `Reading additional input from stdin...` 挂等 EOF；④ `model_reasoning_effort=low`——配置默认可能是 xhigh，慢。注意 `default_tools_approval_mode` 合法值仅 `auto/prompt/writes/approve`（无 `never`）。
+> 17. **ACP 程序化登录（免 TUI 重新登录）**：完整版 CLI 支持 `codebuddy -d acp --acp --acp-transport stdio --port <随机高端口>`，JSON-RPC over stdio：`initialize` → `authenticate {"methodId":"internal"}`（微信登录；另有 iOA/external/selfhosted）→ 服务端发通知 `_codebuddy.ai/authUrl`（形如 `https://copilot.tencent.com/login?platform=CLI&state=<UUID>&version=<ver>`）→ 用户浏览器授权后 `authenticate` 响应携带 `codebuddy.ai/userinfo`（userId/userName/authType）。**必须净环境 spawn**（见陷阱 3）。登录态持久化到磁盘，之后 headless `--print` 直接复用。参考实现 `scripts/acp_auth_driver.mjs`。
+> 18. **SKILL.md 严禁 UTF-8 BOM**：BOM 会使 frontmatter 分隔符 `---` 失配，codex 报 `failed to load skill ...: missing YAML frontmatter delimited by ---`，技能静默不加载。中文 md 给人看可以带 BOM，**给机器解析的技能文件必须剥 BOM**（读缓冲去掉开头 `EF BB BF` 三字节）。
 
 ## 排错决策树
 
 | 现象 | 首查 |
 |---|---|
 | `Not connected`（WorkBuddy 侧） | 是否改过配置 → 重新信任 MCP |
-| 反向报"需要登录" | 三步：① 是否用了内置 CLI → 换完整版；② 环境变量是否被劫持；③ **完整版登录态是否过期（TTL 约 7h）→ 终端 `codebuddy` → `/login`** |
+| 反向报"需要登录" | 三步：① 是否用了内置 CLI → 换完整版；② 环境变量是否被劫持；③ **完整版登录态是否过期（TTL 约 7h）→ 终端 `codebuddy` → `/login`，或用 ACP 程序化登录（陷阱 17）免 TUI** |
+| `codex exec` 挂起不返回 / 一直 "Reading additional input from stdin" | stdin 未关 → 命令尾加 `< /dev/null`；仍挂查代理（64116 已死 → 显式覆盖 7890） |
+| `MCP tool call requires approval, but approval policy is never` | `default_tools_approval_mode` 改用 `approve`（`auto` 不够） |
+| `failed to load skill ... missing YAML frontmatter delimited by ---` | SKILL.md 带了 UTF-8 BOM → 剥掉（陷阱 18） |
 | `Cannot find module '../dist/codebuddy'` | 误用内置 CLI 走 TUI 分支 → 换完整版 |
 | 模型不支持 | `CODEX_BIN` 是否指向老引擎 |
 | 正向 `spawn ...codex.exe ENOENT` | App 升级换了引擎 hash → 桥已自动发现；仍失败则检查 `bin` 目录结构 |
@@ -132,8 +150,9 @@ tool_timeout_sec = 600
 
 ## 验收
 
-- **正向**：WorkBuddy 调 `ask_codex` 发一个 ping，应返回 `thread_id` + 正确回显。（2026-10-14 复验通过：ping 回环 + 监视器捕获双向消息；引擎 hash 自动发现生效。）
-- **反向**：普通终端运行 `scripts/bridge_ping_workbuddy_test.mjs`（先改 `CLI_ENTRY` 为完整版路径），或让 Codex 调 `ask_workbuddy`，应返回 `session_id` + 正确回显。**前置检查**：完整版 CLI 登录态在有效期内（过期表现：`Authentication required`，修复 `/login`）。
+- **正向**：WorkBuddy 调 `ask_codex` 发一个 ping，应返回 `thread_id` + 正确回显。（2026-10-15 复验通过：`WB-FORWARD-PING-1015-OK`；引擎 hash 自动发现生效。）
+- **反向**：普通终端运行 `scripts/bridge_ping_workbuddy_test.mjs`（先改 `CLI_ENTRY` 为完整版路径），或让 Codex 调 `ask_workbuddy`，应返回 `session_id` + 正确回显。**前置检查**：完整版 CLI 登录态在有效期内（过期表现：`Authentication required`，修复 `/login` 或 ACP 程序化登录）。
+- **2026-10-15 全链路复验通过**：ACP 程序化登录（用户「熊猫师父」）后登录态持久化生效；正向 `ask_codex` 回显 `WB-FORWARD-PING-1015-OK`；反向 `codex exec`（配方见陷阱 16）回显 `WB-REVERSE-PING-1015-OK`，stderr 见 `mcp: workbuddy_bridge/ask_workbuddy started → (completed)`，监视器捕获 `workbuddy user → assistant` 双向消息。
 
 ## 参考
 

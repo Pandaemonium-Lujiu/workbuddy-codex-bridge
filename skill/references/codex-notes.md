@@ -1,4 +1,4 @@
-﻿# Codex 侧技术笔记（由 Codex 本人审阅补充，2026-10-14）
+# Codex 侧技术笔记（由 Codex 本人审阅补充，2026-10-14）
 
 本文件是 Codex 对桥接技能的**增量审阅意见**，覆盖 app-server 协议、配置语义、审批/沙箱、线程续接等 Codex 侧专属知识。原始审阅由 Codex（gpt-6-luna，effort=medium，thread 01a13852-bcb5-70d3-97fe-fd8c2743ffb8）通过 `ask_codex` 返回。
 
