@@ -185,6 +185,7 @@ async function runCodex({ prompt, thread_id, cwd, access, effort }) {
   const args = [
     "app-server", "--listen", "stdio://",
     "-c", "mcp_servers.workbuddy_bridge.enabled=false",
+    "-c", "mcp_servers.qoder_bridge.enabled=false",
   ];
   const rpc = startJsonRpcProcess(codexBin, args, { cwd: workingDirectory });
   const sandbox = access === "workspace-write" ? "workspace-write" : "read-only";
@@ -261,6 +262,27 @@ function extractWorkBuddyText(stdout) {
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) {
+        const finalResult = [...parsed].reverse().find((item) =>
+          item?.type === "result" && item.is_error !== true && typeof item.result === "string" && item.result.trim(),
+        );
+        if (finalResult) return finalResult.result;
+        const assistant = [...parsed].reverse().find((item) =>
+          item?.type === "message" && item.role === "assistant" && item.status === "completed",
+        );
+        if (assistant) {
+          if (typeof assistant.text === "string") return assistant.text;
+          if (typeof assistant.content === "string") return assistant.content;
+          if (Array.isArray(assistant.content)) {
+            const text = assistant.content
+              .filter((item) => ["output_text", "text"].includes(item?.type) && typeof item.text === "string")
+              .map((item) => item.text)
+              .join("\n")
+              .trim();
+            if (text) return text;
+          }
+        }
+      }
       if (typeof parsed.result === "string") return parsed.result;
       if (typeof parsed.output === "string") return parsed.output;
       if (typeof parsed.text === "string") return parsed.text;
@@ -295,7 +317,7 @@ function cleanWorkBuddyEnv() {
   return env;
 }
 
-async function runWorkBuddy({ prompt, session_id, cwd, permission_mode }) {
+async function runWorkBuddy({ prompt, session_id, cwd, permission_mode, allow_callback }) {
   const workingDirectory = ensureDirectory(cwd);
   const entry = process.env.WORKBUDDY_CLI_ENTRY;
   if (!entry || !fs.existsSync(entry)) {
@@ -305,7 +327,13 @@ async function runWorkBuddy({ prompt, session_id, cwd, permission_mode }) {
   if (!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,120}$/.test(sessionId)) {
     throw new Error("session_id 只能包含字母、数字、冒号、下划线或连字符，且必须以字母或数字开头。");
   }
-  const permissionMode = permission_mode || "plan";
+  // 回拨 Codex 的显式提权开关：默认关闭，需服务端 env + 调用方参数双开。
+  const wantCallback = allow_callback === true;
+  if (wantCallback && process.env.WORKBUDDY_CLI_ALLOW_CALLBACK !== "1") {
+    throw new Error("allow_callback 需要服务端设置 WORKBUDDY_CLI_ALLOW_CALLBACK=1（默认关闭的显式提权能力）。");
+  }
+  // 子会话要调用 MCP 工具必须绕过非交互审批（DeferExecuteTool 在 --print 下无法弹确认）。
+  const permissionMode = wantCallback ? "bypassPermissions" : (permission_mode || "plan");
   const cliPort = process.env.WORKBUDDY_CLI_PORT || String(50000 + Math.floor(Math.random() * 10000));
   const args = [
     entry,
@@ -314,6 +342,26 @@ async function runWorkBuddy({ prompt, session_id, cwd, permission_mode }) {
     "--port", cliPort,
     "--permission-mode", permissionMode,
   ];
+  // 回拨能力（2026-10-21 实测选型）：headless CLI 子会话默认零 MCP（~/.codebuddy/ 无 mcp.json），
+  // 故 Codex 让 WorkBuddy “反过来 ping 一下”必然失败。开启后注入最小 MCP 配置（仅 codex_bridge），
+  // 配合上面的 bypassPermissions 才能通过非交互审批。⚠️ 这会放大 Codex 可触发子会话的权限，按需开启。
+  if (wantCallback) {
+    const callbackServer = path.resolve(process.argv[1]);
+    const callbackConfig = {
+      mcpServers: {
+        codex_bridge: {
+          type: "stdio",
+          command: process.execPath,
+          args: [callbackServer, "codex"],
+          env: {
+            CODEX_BRIDGE_MODEL: readBridgeSettings().codexModel,
+            CODEX_BRIDGE_EFFORT: CODEX_EFFORT,
+          },
+        },
+      },
+    };
+    args.push("--mcp-config", JSON.stringify(callbackConfig));
+  }
   const model = readBridgeSettings().workbuddyModel;
   if (model) args.push("--model", model);
   if (session_id) args.push("--resume", sessionId);
@@ -422,16 +470,17 @@ async function main() {
   } else {
     server.registerTool("ask_workbuddy", {
       title: "Ask WorkBuddy",
-      description: "把问题交给 WorkBuddy 的本机 headless CLI。默认 plan 模式，不编辑文件。把返回的 session_id 用于后续轮次；只有明确指定 acceptEdits 时才允许 WorkBuddy 执行文件编辑。不会使用跳过权限检查的参数。",
+      description: "把问题交给 WorkBuddy 的本机 headless CLI。默认 plan 模式，不编辑文件。把返回的 session_id 用于后续轮次；只有明确指定 acceptEdits 时才允许 WorkBuddy 执行文件编辑。不会使用跳过权限检查的参数。allow_callback=true 时允许该子会话回拨 Codex（需服务端开启 WORKBUDDY_CLI_ALLOW_CALLBACK=1，子会话将以 bypassPermissions 运行——显式提权，仅用于需要嵌套对话的场景）。",
       inputSchema: {
         prompt: z.string().min(1).max(30000).describe("发给 WorkBuddy 的任务或问题"),
         session_id: z.string().min(1).optional().describe("延续 WorkBuddy 对话时使用上一次返回的 session_id"),
         cwd: z.string().optional().describe("工作目录；省略时使用启动 MCP 服务时的当前目录"),
         permission_mode: z.enum(["plan", "default", "acceptEdits"]).optional().describe("默认 plan；只有明确需要编辑当前工作区时才指定 acceptEdits"),
+        allow_callback: z.boolean().optional().describe("允许本次子会话回拨 Codex（需服务端 env WORKBUDDY_CLI_ALLOW_CALLBACK=1；子会话会以 bypassPermissions 运行，属显式提权，默认 false）"),
       },
-    }, async ({ prompt, session_id, cwd, permission_mode }) => {
+    }, async ({ prompt, session_id, cwd, permission_mode, allow_callback }) => {
       try {
-        const result = await runWorkBuddy({ prompt, session_id, cwd, permission_mode });
+        const result = await runWorkBuddy({ prompt, session_id, cwd, permission_mode, allow_callback });
         return toolResult(`session_id: ${result.sessionId}\n模型: ${result.model || "WorkBuddy CLI 默认模型"}\n权限模式: ${result.permissionMode}\n工作目录: ${result.cwd}\n\n${result.answer}`);
       } catch (error) {
         return { ...toolResult(`WorkBuddy 调用失败：${redact(error.message)}`), isError: true };

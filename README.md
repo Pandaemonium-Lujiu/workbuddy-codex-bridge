@@ -1,6 +1,6 @@
 # WorkBuddy ↔ Codex 本机对话桥
 
-这套桥接让 WorkBuddy 和 Codex 通过本机 MCP 工具互相发起对话，并分别延续各自的会话。
+这套桥接让 WorkBuddy、Codex、DSH 和 Qoder CN 通过本机 MCP 工具互相发起对话，并分别延续各自的会话。
 
 ## 能力与权限
 
@@ -8,6 +8,9 @@
 - WorkBuddy 侧还提供 `ask_dsh` / `ask_dsh_edit` / `list_dsh_sessions`（经 `dsh_bridge`），调用本机 DSH（DeepSeek Harness）。默认只读。
 - `ask_codex` 默认显式使用 `gpt-6-luna` 和 `low` 推理强度，避免继承本机 Codex 配置中不可用或过慢的默认项；可通过 `CODEX_BRIDGE_MODEL`、`CODEX_BRIDGE_EFFORT` 覆盖，也可在调用时指定 `effort`。
 - Codex 侧提供 `ask_workbuddy`，通过 WorkBuddy 自带 CLI 调用 WorkBuddy。默认 `plan` 模式；只有明确需要编辑工作区时，才设 `permission_mode: "acceptEdits"`。
+- `ask_workbuddy` 拉起的子会话**默认零 MCP**（看不到 `ask_codex`，无法回拨）——这是刻意的封口，不是故障。需要嵌套回拨时：服务端设 `WORKBUDDY_CLI_ALLOW_CALLBACK=1` + 调用参数 `allow_callback: true`（桥注入最小 `codex_bridge` MCP 配置，并让子会话以 `bypassPermissions` 运行——**显式提权**，按需开启）。
+- Codex 侧提供 `ask_qoder`，通过 Qoder CN Agent SDK 调用 Qoder。当前仅开放工作目录内的只读文件检索。
+- Qoder 可通过其 stdio MCP 配置启动本桥 `codex` 模式，调用 `ask_codex`；其生效配置路径尚待 Qoder 本机只读确认。
 - 两边返回 `thread_id` / `session_id`。后续调用传回同一 ID，即可续接该侧对话。
 - 两边都在本机通过 stdio 通信，不需要开放 HTTP 端口或公网地址。
 - 桥只负责提供对话工具；不会在一侧结束时自动唤起另一侧，也不会自行循环。由当前对话中的 AI 按任务需要调用对方。
@@ -40,14 +43,49 @@
 
 实测：正向 `ask_dsh` 回显通过（模型 deepseek-V4.1-Flash）；反向 `ask_workbuddy` 代码路径验到 API 层（净化修复后认证通过），仅剩 WorkBuddy CLI 账号额度（429）待恢复。接入细节与坑见技能版 SKILL.md「三方互通：DSH」章节。
 
+## 接入 Qoder CN
+
+### Codex → Qoder
+
+- Codex 本机 MCP 项 `qoder_bridge` 启动 `qoder-server.mjs`，提供 `ask_qoder`。
+- 使用官方 `@qodercn-ai/qodercn-agent-sdk`，依赖及其配套 Worker runtime 安装在本项目内。
+- 当前权限固定为只读：仅开放 `Read`、`Grep`、`Glob`，工作目录固定到首轮请求指定的目录，并拒绝目录外路径；不开放 shell、编辑、MCP 或子 Agent 工具。
+- SDK 明确使用项目内自带的 Worker runtime，不要求单独安装 Qoder CLI。默认通过 `qodercliAuth()` 读取本机登录态；设置 `QODERCN_PERSONAL_ACCESS_TOKEN` 或 `QODER_PERSONAL_ACCESS_TOKEN` 时改用对应环境变量认证。`qodercliAuth()` 能否复用 Qoder 桌面登录仍未证实，失败时需另行配置受支持的认证方式。
+- `ask_qoder` 返回桥接 `session_id`。映射文件放在 `%USERPROFILE%\.codex\bridges\qoder\sessions`，只保存 Qoder session ID、工作目录和时间戳；续聊固定使用首轮工作目录。
+- 可用 `QODERCN_BRIDGE_MODEL` 指定模型，`QODERCN_BRIDGE_TIMEOUT_MS` 调整超时（最短 1 秒，最长 30 分钟）。
+
+### Qoder → Codex
+
+Qoder 的 stdio MCP 配置可启动 `node server.mjs codex`，复用现有 Codex app-server 适配器并通过 `ask_codex` 对话。官方配置支持 `command`、`args`、`env`、`cwd`；当前桌面会话通过 `--mcp-config` 注入配置，因此应从 Qoder 的自定义 MCP 管理入口添加，不要手改 `mcp.json` / `settings.json` 镜像文件。新增服务器后，若当前会话没有加载它，需新开 Qoder 会话。调用 `ask_codex` 时显式传 `cwd`。
+
+建议服务器配置（通过 Qoder 管理入口新增；不要直接写入配置文件）：
+
+```json
+{
+  "type": "stdio",
+  "command": "C:\\Program Files\\nodejs\\node.exe",
+  "args": [
+    "C:\\Users\\EDY\\Documents\\Codex\\2026-10-13\\new-chat\\outputs\\workbuddy-codex-bridge\\server.mjs",
+    "codex"
+  ],
+  "cwd": "C:\\Users\\EDY\\Documents\\Codex\\2026-10-13\\new-chat\\outputs\\workbuddy-codex-bridge",
+  "timeout": 600000,
+  "includeTools": ["ask_codex"]
+}
+```
+
+为防止跨端无限回环，`server.mjs codex` 会在创建 Codex 子会话时临时禁用 `workbuddy_bridge` 和 `qoder_bridge`。因此被 WorkBuddy 或 Qoder 调起的 Codex 子会话只处理当前交接，不会再调用回派发方。
+
+Qoder 官方文档：[CLI](https://qoder.com.cn/cli)、[ACP](https://docs.qoder.cn/cli/acp)、[Agent SDK](https://docs.qoder.cn/en/cli/sdk/overview)、[MCP 配置](https://docs.qoder.cn/cli/mcp-reference)。
+
 ## 配置位置
 
 安装脚本会在两个现有配置中各添加一个独立 MCP 项，不覆盖已有服务器：
 
 - WorkBuddy：`%USERPROFILE%\.workbuddy\mcp.json`，服务器名 `codex_bridge`
-- Codex：`%USERPROFILE%\.codex\config.toml`，服务器名 `workbuddy_bridge`
+- Codex：`%USERPROFILE%\.codex\config.toml`，服务器名 `workbuddy_bridge`、`qoder_bridge`
 
-配置修改前会在原目录保存带时间戳的备份。WorkBuddy 需要重启或重新加载 MCP；Codex 需要重新加载配置或重启应用。
+修改 Codex 配置前先保存带时间戳的备份，并在临时副本上通过 TOML 解析后再替换正式配置。WorkBuddy 需要重启或重新加载 MCP；Codex 需要重新加载配置或重启应用。
 
 ## 使用方式
 
@@ -63,6 +101,12 @@
 
 续谈时把之前返回的 `session_id` 传给 `ask_workbuddy`。如果任务确实需要 WorkBuddy 修改当前工作区，再明确指定 `permission_mode: "acceptEdits"`。
 
+让 Codex 调用 Qoder：
+
+> 请用 `ask_qoder` 只读检查当前项目的 README 结构，并把结论和 `session_id` 返回给我。
+
+续谈时把之前返回的 `session_id` 传给 `ask_qoder`。
+
 ## 实现说明
 
-MCP 工具由 `@modelcontextprotocol/sdk` 提供。WorkBuddy → Codex 使用 Codex app-server 的 stdio JSON-RPC；Codex → WorkBuddy 使用 WorkBuddy CLI 的非交互式 JSON 输出。Codex 官方文档推荐 app-server 用于需要持久对话和任务事件的集成；当前 Codex CLI 将 app-server 标为 experimental，因此其协议未来可能变化。
+MCP 工具由 `@modelcontextprotocol/sdk` 提供。WorkBuddy → Codex 使用 Codex app-server 的 stdio JSON-RPC；Codex → WorkBuddy 使用 WorkBuddy CLI 的非交互式 JSON 输出；Codex → Qoder 使用官方 Qoder CN Agent SDK。Codex 官方文档推荐 app-server 用于需要持久对话和任务事件的集成；当前 Codex CLI 将 app-server 标为 experimental，因此其协议未来可能变化。

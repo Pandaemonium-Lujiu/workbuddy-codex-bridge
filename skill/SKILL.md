@@ -1,19 +1,20 @@
 ---
 name: workbuddy-codex-bridge
-description: 本机 WorkBuddy 与 OpenAI Codex / DSH（DeepSeek Harness）多宿主双向任务交接桥的部署、配置、调用与排错。当需要让 WorkBuddy 与 Codex / DSH 互相派活、传递上下文、续接会话，或桥接报错（"需要登录"/"Not connected"/端口占用/模型不支持/工具缺失/续接失败）时使用本技能。
+description: 本机 WorkBuddy、OpenAI Codex、DSH（DeepSeek Harness）与 Qoder CN 多宿主任务交接桥的部署、配置、调用与排错。当需要这些 Agent 互相派活、传递上下文、续接会话，或桥接报错（"需要登录"/"Not connected"/端口占用/模型不支持/工具缺失/续接失败）时使用本技能。
 agent_created: true
-version: 2.3
+version: 2.4
 contributors: [WorkBuddy (小Q), OpenAI Codex, DSH (DeepSeek Harness)]
 ---
 
-# WorkBuddy ↔ Codex 双向交接桥
+# WorkBuddy / Codex / DSH / Qoder CN 多宿主交接桥
 
 ## 用途
 
-让本机两个 AI 通过 MCP 互相派活并延续各自会话：
+让本机多个 AI 通过 MCP 互相派活并延续各自会话：
 
 - **正向** `WorkBuddy → Codex`：WorkBuddy 调 `ask_codex`，走 Codex **app-server**（stdio JSONL / JSON-RPC 2.0），返回 `thread_id` 续聊。
 - **反向** `Codex → WorkBuddy`：Codex 调 `ask_workbuddy`，走 WorkBuddy **CLI headless** JSON 输出，返回 `session_id` 续聊。
+- **Codex ↔ Qoder CN**：Codex 调 `ask_qoder`，走官方 Qoder CN Agent SDK 自带的 Worker runtime（只读工具集，返回桥接 `session_id`）；Qoder 侧通过 stdio MCP 启动 `server.mjs codex` 并调用 `ask_codex`。Qoder 桌面 MCP 应通过其受控管理入口配置，因为桌面会话可用 `--mcp-config` 覆盖磁盘文件；桌面登录能否被 SDK 的 `qodercliAuth()` 复用尚未验证。
 
 两侧均本机 stdio 通信，不开放 HTTP 端口、不需要公网地址。
 
@@ -23,10 +24,12 @@ contributors: [WorkBuddy (小Q), OpenAI Codex, DSH (DeepSeek Harness)]
 
 | 组件 | 路径 |
 |---|---|
-| 桥脚本（两模式：`codex` / `workbuddy`） | `%USERPROFILE%\Documents\Codex\<date>\new-chat\outputs\workbuddy-codex-bridge\server.mjs` |
+| 桥脚本（`codex` / `workbuddy`） | `%USERPROFILE%\Documents\Codex\<date>\new-chat\outputs\workbuddy-codex-bridge\server.mjs` |
+| Qoder CN → Codex 桥脚本 | `%USERPROFILE%\Documents\Codex\<date>\new-chat\outputs\workbuddy-codex-bridge\server.mjs codex` |
+| Codex → Qoder CN SDK 服务 | `%USERPROFILE%\Documents\Codex\<date>\new-chat\outputs\workbuddy-codex-bridge\qoder-server.mjs` |
 | DSH 互通桥（WorkBuddy→DSH，Codex 侧建） | `%USERPROFILE%\Documents\Codex\<date>\new-chat\outputs\codex-dsh-bridge\server.mjs`（自带 DSH Web 后端 `127.0.0.1:3082`） |
 | WorkBuddy 侧 MCP 配置 | `%USERPROFILE%\.workbuddy\mcp.json` → server 名 `codex_bridge` / `dsh_bridge` |
-| Codex 侧 MCP 配置 | `%USERPROFILE%\.codex\config.toml` → `[mcp_servers.workbuddy_bridge]` |
+| Codex 侧 MCP 配置 | `%USERPROFILE%\.codex\config.toml` → `[mcp_servers.workbuddy_bridge]`、`[mcp_servers.qoder_bridge]` |
 | DSH 侧 MCP 配置 | `%USERPROFILE%\.dsh\profiles\<web\|desktop>\cordis.patch.yml` → 插件 `mcp-workbuddy-bridge` |
 | 完整版 CLI（反向必需） | `%APPDATA%\npm\node_modules\@tencent-ai\codebuddy-code\bin\codebuddy` |
 | 内置 CLI（**不可用于反向**） | `%LOCALAPPDATA%\Programs\WorkBuddy\resources\app.asar.unpacked\cli\bin\codebuddy` |
@@ -37,6 +40,7 @@ contributors: [WorkBuddy (小Q), OpenAI Codex, DSH (DeepSeek Harness)]
 2. Codex 已安装并登录（`~/.codex/auth.json` 存在）。
 3. **完整版 WorkBuddy CLI 已安装并登录**：`npm i -g @tencent-ai/codebuddy-code`，然后终端运行 `codebuddy` → 选「Log in via Chinese Site」→ 浏览器授权。
 4. 桥脚本已加入两侧配置（见下）。
+5. 若启用 Codex → Qoder，需安装项目依赖；首次调用还需要 Qoder CN CLI 登录态，或设置 `QODERCN_PERSONAL_ACCESS_TOKEN`。
 
 ## 配置要点
 
@@ -85,7 +89,7 @@ tool_timeout_sec = 600
 ## 调用方式
 
 - **WorkBuddy 内**：`ask_codex`（→Codex）与 `ask_dsh`（→DSH，经 `dsh_bridge`）；续聊分别传回上次 `thread_id` / `session_id`。关键参数：`access`（read-only 默认 / workspace-write）、`effort`（low~xhigh）、`cwd`。
-- **Codex 内**：用 `ask_workbuddy`；续聊传回上次 `session_id`。
+- **Codex 内**：用 `ask_workbuddy`；续聊传回上次 `session_id`。参数 `permission_mode`（plan 默认 / default / acceptEdits）；**`allow_callback: true` 可让这次子会话回拨 Codex**（需服务端 `WORKBUDDY_CLI_ALLOW_CALLBACK=1`，显式提权，见陷阱 23）。
 - **DSH 内**：用 `ask_workbuddy`（与 Codex 侧同一条代码路径，DSH profile 插件注册）。
 
 > **thread 续接（Codex 补充）**
@@ -151,7 +155,7 @@ DSH 后端会话同样能调 MCP，需按 id 禁用回呼 WorkBuddy 的条目，
 4. **代理污染**：会话注入的 `HTTP_PROXY`（如 `127.0.0.1:49262`）常无法访问境外服务。Codex 报 `stream disconnected before completion` 时，改用可用代理（实测 `127.0.0.1:7890` 可通，HTTP 405 = 网络正常）或直连。
 5. **端口占用**：CLI 启动会复用记录的端口，可能 `EADDRINUSE`。桥调用 CLI 时应传 `--port <随机端口>`。
 6. **安全中心黑名单**：部分沙箱/安全策略拦截 `reg.exe`，导致完整版 CLI 无法读注册表解密凭证 → 报 `Authentication required`。此限制**不可绕过**，需在真实环境（普通终端）执行。
-7. **递归防护**：桥调 Codex 时传 `-c mcp_servers.workbuddy_bridge.enabled=false`，故在 `ask_codex` 路径下看不到 `ask_workbuddy` 工具，属正常设计。**该覆盖只影响这次子进程**，不改主客户端工具列表。
+7. **递归防护**：桥调 Codex 时传 `-c mcp_servers.workbuddy_bridge.enabled=false` 和 `-c mcp_servers.qoder_bridge.enabled=false`，故被 WorkBuddy 或 Qoder 调起的 Codex 子会话不会看到交接工具并再次回派。**该覆盖只影响这次子进程**，不改主客户端工具列表。
 8. **模型可用性不是稳定白名单**：`gpt-6-luna` / `gpt-6.1-sol` 曾实测可用，但模型可用性取决于**账号、工作区权限、引擎版本**。升级或权限变化后须重验；可用 app-server `model/list` 查询可见模型（**可见 ≠ 可调用**）。排错时同时记录引擎版本 + 模型名 + 返回错误。
 
 > **Codex 补充的排查项**
@@ -185,6 +189,9 @@ DSH 后端会话同样能调 MCP，需按 id 禁用回呼 WorkBuddy 的条目，
 > 20. **reg.exe/WMIC 沙箱黑名单非致命**：被安全中心拦截时 CLI 打印 notice 后仍继续跑到 API 层。旧认知（pitfalls.md #10"必然 Authentication required、不可绕过"）判断过强——真实根因是环境变量污染（陷阱 19），黑名单只影响 notice。
 > 21. **DSH 宿主两级防崩**：① **重复 loader entry id 会崩整个宿主**——`mcp-wielo-skillhub` 在 web 与 desktop 两个 profile 都存在，两 patch 叠加加载即 `duplicate loader entry id`（单 profile 各载均正常）；DSH"启动即崩"先查跨 profile 重复 id。② 外部 MCP 连接失败不应拖垮宿主——插件条目用 `failOnStartupError: false`。
 > 22. **429 额度是账号级**：换模型（glm-5.3-flash / qwen3.5-max / deepseek-v4.1-flash / 默认）均 429 → 不是模型问题，是 https://www.codebuddy.cn/profile/usage 账号额度。桥的 `classifyWorkBuddyFailure` 已加 429 分支，直接把购买链接抛给调用方。
+>
+> **第五轮实战补充（2026-10-21，子会话回拨的真相）**
+> 23. **子会话回拨 Codex 默认不可用（递归保险丝的镜像）**：`ask_workbuddy` 拉起的 headless WB CLI 会话**默认零 MCP**（`~/.codebuddy/` 无 mcp.json），所以「Codex 让 WorkBuddy 反过来 ping 一下」必然失败——**不是链路断，而是子会话被刻意封死**。四组对照实测：A 无 `--mcp-config` → 零 MCP 工具；B 仅 `--mcp-config` → 工具可见但 `DeferExecuteTool` 被非交互审批拒绝（`permission prompts are not available in non-interactive mode`）；C 补 `--allowedTools DeferExecuteTool` **仍拒绝**（该参数管不住 deferred 包装器）；D `--permission-mode bypassPermissions` + `--mcp-config` → **回拨成功**。**已内置 opt-in**：服务端 `WORKBUDDY_CLI_ALLOW_CALLBACK=1` + 调用参数 `allow_callback: true` → 桥自动注入最小 MCP 配置（仅 codex_bridge）并让子会话以 `bypassPermissions` 运行（实测 `WB-VIA-BRIDGE-CALLBACK-1021-OK`，30s，Codex thread 正常返回）。⚠️ 这是**显式提权**（子会话获得写文件/执行命令能力），仅在确实需要嵌套对话时开；默认关闭，宿主级双向通信不依赖它。
 
 ## 排错决策树
 
@@ -193,6 +200,7 @@ DSH 后端会话同样能调 MCP，需按 id 禁用回呼 WorkBuddy 的条目，
 | `Not connected`（WorkBuddy 侧） | 是否改过配置 → 重新信任 MCP |
 | 反向报"需要登录" | 三步：① 是否用了内置 CLI → 换完整版；② 环境变量是否被劫持（元凶常是 `CLIENT_INFO_PRODUCT_NAME`，见陷阱 19）；③ **完整版登录态是否过期（TTL 约 7h）→ 终端 `codebuddy` → `/login`，或用 ACP 程序化登录（陷阱 17）免 TUI** |
 | 反向报 `429 额度已用尽` | 账号级额度 → https://www.codebuddy.cn/profile/usage 购买加量包（陷阱 22） |
+| Codex 说"WorkBuddy 回程没通" / 子会话看不到 `ask_codex` | **结构性限制，不是故障**（陷阱 23）：子会话默认零 MCP。宿主级双向正常；要回拨需服务端 `WORKBUDDY_CLI_ALLOW_CALLBACK=1` + 调用参数 `allow_callback: true` |
 | DSH 启动即崩 `duplicate loader entry id` | 跨 profile 重复插件 id → 逐个查 `cordis.patch.yml`（陷阱 21） |
 | DSH 里看不到 `ask_workbuddy` 工具 | profile 补丁未加载 → 重启 DSH；或 `failOnStartupError` 吞掉了启动错误 → 看 DSH 日志 |
 | `codex exec` 挂起不返回 / 一直 "Reading additional input from stdin" | stdin 未关 → 命令尾加 `< /dev/null`；仍挂查代理（64116 已死 → 显式覆盖 7890） |
@@ -213,6 +221,7 @@ DSH 后端会话同样能调 MCP，需按 id 禁用回呼 WorkBuddy 的条目，
 - **反向**：普通终端运行 `scripts/bridge_ping_workbuddy_test.mjs`（先改 `CLI_ENTRY` 为完整版路径），或让 Codex 调 `ask_workbuddy`，应返回 `session_id` + 正确回显。**前置检查**：完整版 CLI 登录态在有效期内（过期表现：`Authentication required`，修复 `/login` 或 ACP 程序化登录）。
 - **2026-10-15 全链路复验通过**：ACP 程序化登录（用户「熊猫师父」）后登录态持久化生效；正向 `ask_codex` 回显 `WB-FORWARD-PING-1015-OK`；反向 `codex exec`（配方见陷阱 16）回显 `WB-REVERSE-PING-1015-OK`，stderr 见 `mcp: workbuddy_bridge/ask_workbuddy started → (completed)`，监视器捕获 `workbuddy user → assistant` 双向消息。
 - **2026-10-15 DSH 三方互通**：正向 `ask_dsh` 复验通过（手工 MCP 客户端驱动 `dsh_bridge` → 回显 `DSH-SMOKE-1015-OK`，模型 deepseek-V4.1-Flash）；反向 `ask_workbuddy` 代码路径验到 API 层（`cleanWorkBuddyEnv` 净化后认证通过），仅剩 WorkBuddy CLI 账号 429 额度墙——缴费/购买后重跑同类探针即可闭环。两侧配置已落地：WorkBuddy `mcp.json`（`dsh_bridge`，**需重启会话生效**）、DSH web/desktop profile（`mcp-workbuddy-bridge`，**需重启 DSH 生效**）、`backend.patch.yml` 防递归 disable。
+- **2026-10-21 互通复检 + 回拨能力落地**：正向 `ask_codex` 回显 `WB-TO-CODEX-PING-1021-OK`（gpt-6.1-sol；Codex 引擎 hash 再变，`resolveCodexBin()` 自动发现生效）；反向 `codex exec` 回显 `WB-CODEX-E2E-1021-OK`（stderr `ask_workbuddy started→(completed)`，18,944 tokens）；**429 额度已恢复**；桥内回拨 `allow_callback` 实测 `WB-VIA-BRIDGE-CALLBACK-1021-OK`（30s，子会话 → Codex thread 正常返回）。
 
 ## 参考
 
